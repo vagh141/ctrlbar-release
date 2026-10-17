@@ -26,6 +26,10 @@ on:
       sha256:
         description: "sha256 of the binary (from the rig manifest)"
         required: true
+      dry_run:
+        description: "dry run: all checks (approval, key, source file, sha256, target free) but NO upload"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -48,6 +52,7 @@ jobs:
           PRODUCT: ${{ inputs.product }}
           VERSION: ${{ inputs.version }}
           SHA256: ${{ inputs.sha256 }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           case "$PRODUCT" in bar) base=fw-v2;; bridge) base=fw-obd;; *) echo "bad product"; exit 1;; esac
@@ -57,6 +62,8 @@ jobs:
           aws s3 cp "s3://${base}-dev/${VERSION}.bin" fw.bin --only-show-errors
           got=$(sha256sum fw.bin | cut -d' ' -f1)
           [ "$got" = "$SHA256" ] || { echo "sha256 mismatch: dev has $got"; exit 1; }
+          if aws s3api head-object --bucket "${base}-stage" --key "${VERSION}.bin" >/dev/null 2>&1; then echo "${VERSION}.bin already in ${base}-stage"; exit 1; fi
+          if [ "$DRY_RUN" = true ]; then echo "DRY RUN OK: approval, key, dev file and sha256 verified; ${base}-stage/${VERSION}.bin is free; nothing uploaded" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
           aws s3api put-object --bucket "${base}-stage" --key "${VERSION}.bin" --body fw.bin --if-none-match '*' \
             --content-type application/octet-stream >/dev/null
           aws s3 cp "s3://${base}-stage/${VERSION}.bin" back.bin --only-show-errors
@@ -76,6 +83,7 @@ jobs:
           PRODUCT: ${{ inputs.product }}
           VERSION: ${{ inputs.version }}
           SHA256: ${{ inputs.sha256 }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           case "$PRODUCT" in bar) base=fw-v2;; bridge) base=fw-obd;; *) echo "bad product"; exit 1;; esac
@@ -86,6 +94,8 @@ jobs:
           aws s3 cp "s3://${base}-stage/${VERSION}.bin" fw.bin --only-show-errors
           got=$(sha256sum fw.bin | cut -d' ' -f1)
           [ "$got" = "$SHA256" ] || { echo "sha256 mismatch: stage has $got"; exit 1; }
+          if aws s3api head-object --bucket "$base" --key "${VERSION}.bin" >/dev/null 2>&1; then echo "${VERSION}.bin already in $base"; exit 1; fi
+          if [ "$DRY_RUN" = true ]; then echo "DRY RUN OK: approval, key, stage file and sha256 verified; ${base}/${VERSION}.bin is free; nothing uploaded" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; fi
           aws s3api put-object --bucket "$base" --key "${VERSION}.bin" --body fw.bin --if-none-match '*' \
             --content-type application/octet-stream >/dev/null
           aws s3 cp "s3://${base}/${VERSION}.bin" back.bin --only-show-errors
