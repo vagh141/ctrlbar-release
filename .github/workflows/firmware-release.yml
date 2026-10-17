@@ -1,0 +1,93 @@
+# Firmware release with owner approval (Greenmission Ctrl-Bar / Ctrl-Bridge).
+# The rig puts the exact binary in the dev bucket (fw-v2-dev / fw-obd-dev) and starts this workflow with the
+# version and sha256. The job waits for Vetle's approval:
+#   beta  -> environment "release":      dev   -> stage (beta testers get it at once)
+#   prod  -> environment "release-prod": stage -> prod  (ALL customers; only a binary already in stage)
+# The AWS key exists only as environment secrets. Its IAM policy (Releasekey-Ctrl) can only read dev/stage/prod and
+# ADD new files to stage/prod: overwrite, delete, bucket changes and IAM are denied.
+name: firmware-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: "bar (fw-v2*) or bridge (fw-obd*)"
+        type: choice
+        options: [bar, bridge]
+        required: true
+      channel:
+        description: "beta = stage bucket (beta testers); prod = ALL customers"
+        type: choice
+        options: [beta, prod]
+        required: true
+      version:
+        description: "file name without .bin, plain x.y.z (e.g. 2.1.174)"
+        required: true
+      sha256:
+        description: "sha256 of the binary (from the rig manifest)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  beta:
+    if: inputs.channel == 'beta'
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Copy dev -> stage after checks
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_RELEASE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_RELEASE_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-north-1
+          PRODUCT: ${{ inputs.product }}
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          case "$PRODUCT" in bar) base=fw-v2;; bridge) base=fw-obd;; *) echo "bad product"; exit 1;; esac
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be plain x.y.z (no rig/dev suffix)"; exit 1; }
+          if [ "$PRODUCT" = bridge ] && [ ${#VERSION} -gt 8 ]; then echo "Bridge version > 8 chars breaks BLE advertising"; exit 1; fi
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "sha256 must be 64 lowercase hex"; exit 1; }
+          aws s3 cp "s3://${base}-dev/${VERSION}.bin" fw.bin --only-show-errors
+          got=$(sha256sum fw.bin | cut -d' ' -f1)
+          [ "$got" = "$SHA256" ] || { echo "sha256 mismatch: dev has $got"; exit 1; }
+          aws s3api put-object --bucket "${base}-stage" --key "${VERSION}.bin" --body fw.bin --if-none-match '*' \
+            --content-type application/octet-stream >/dev/null
+          aws s3 cp "s3://${base}-stage/${VERSION}.bin" back.bin --only-show-errors
+          [ "$(sha256sum back.bin | cut -d' ' -f1)" = "$SHA256" ] || { echo "read-back mismatch"; exit 1; }
+          echo "BETA: ${VERSION}.bin -> ${base}-stage, sha256 ${SHA256}, $(stat -c%s fw.bin) bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  prod:
+    if: inputs.channel == 'prod'
+    runs-on: ubuntu-24.04
+    environment: release-prod
+    steps:
+      - name: Copy stage -> prod after checks
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_RELEASE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_RELEASE_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: eu-north-1
+          PRODUCT: ${{ inputs.product }}
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          set -euo pipefail
+          case "$PRODUCT" in bar) base=fw-v2;; bridge) base=fw-obd;; *) echo "bad product"; exit 1;; esac
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be plain x.y.z"; exit 1; }
+          if [ "$PRODUCT" = bridge ] && [ ${#VERSION} -gt 8 ]; then echo "Bridge version > 8 chars breaks BLE advertising"; exit 1; fi
+          [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "sha256 must be 64 lowercase hex"; exit 1; }
+          # Production only takes a binary that already went to beta, byte-identical.
+          aws s3 cp "s3://${base}-stage/${VERSION}.bin" fw.bin --only-show-errors
+          got=$(sha256sum fw.bin | cut -d' ' -f1)
+          [ "$got" = "$SHA256" ] || { echo "sha256 mismatch: stage has $got"; exit 1; }
+          aws s3api put-object --bucket "$base" --key "${VERSION}.bin" --body fw.bin --if-none-match '*' \
+            --content-type application/octet-stream >/dev/null
+          aws s3 cp "s3://${base}/${VERSION}.bin" back.bin --only-show-errors
+          [ "$(sha256sum back.bin | cut -d' ' -f1)" = "$SHA256" ] || { echo "read-back mismatch"; exit 1; }
+          echo "PROD (all customers): ${VERSION}.bin -> ${base}, sha256 ${SHA256}" | tee -a "$GITHUB_STEP_SUMMARY"
